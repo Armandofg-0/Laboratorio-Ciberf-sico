@@ -1,3 +1,5 @@
+import os
+import pickle
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -24,7 +26,7 @@ def preparar_datos(ruta_csv):
     return df_final, df_final[volt_cols + ["Tout"]], df_final[room_cols]
 
 
-ruta_csv = "datos_identificacion_planta_2.csv" # SOLO TIENEN QUE CAMBIAR ESTE NOMBRE PARA SACAR DATOS
+ruta_csv = "datos_identificacion_planta_4.csv" # SOLO TIENEN QUE CAMBIAR ESTE NOMBRE PARA SACAR DATOS
 Train_fraction = 0.8
 _, u1, y1 = preparar_datos(ruta_csv)
 u_cols, y_cols = list(u1.columns), list(y1.columns)
@@ -45,6 +47,23 @@ A, B, C, D = modelo_ee.a, modelo_ee.b, modelo_ee.c, modelo_ee.d
 ny = len(y_cols)
 R, Q = cov[:ny, :ny], cov[ny:, ny:]
 nx, nu = A.shape[0], B.shape[1]
+
+################################################################################
+plant_id = ruta_csv.split("planta_")[1].split(".")[0]
+estimacion = {
+    "A": np.asarray(A, dtype=float), "B": np.asarray(B, dtype=float),
+    "C": np.asarray(C, dtype=float), "D": np.asarray(D, dtype=float),
+    "Q": np.asarray(Q, dtype=float), "R": np.asarray(R, dtype=float),
+    "u_mean": su.mean_, "u_std": su.scale_,   # entradas del modelo: [v1..v6, Tout]
+    "y_mean": sy.mean_, "y_std": sy.scale_,   # salidas del modelo: T de las 6 habitaciones
+    "u_cols": u_cols, "y_cols": y_cols,       # orden de las variables, para armar bien los vectores
+}
+os.makedirs("resultados", exist_ok=True)
+with open(f"resultados/estimacion_planta_{plant_id}.pkl", "wb") as f:
+    pickle.dump(estimacion, f)
+print(f"Estimación guardada en resultados/estimacion_planta_{plant_id}.pkl")
+################################################################################
+
 L = 15
 H = L - 1
 n_win = len(U_val) - L + 1
