@@ -1,4 +1,4 @@
-import os, pickle, numpy as np, torch
+import pickle, numpy as np, torch
 import torch.nn as nn, torch.nn.functional as F, torch.optim as optim
 from KF import DiscreteKalmanFilter
 from buildingClient import MyClient
@@ -75,21 +75,23 @@ def entrenar(model, opt, At, Bt, Ct, Dt, x, yc, v, rn, tout, umean, ustd, H, Wy,
     return J.item(), v0.detach().cpu().numpy()
 
 
-def control(plant_id=2, r_setpoint=22.0, sala=0, H=14, hidden=128, lr=1e-3, Wy=1.0, Wu=0.05, every=10):
-    with open(f"results/estimacion_planta_{plant_id}.pkl", "rb") as f: est = pickle.load(f)
+def control(plant_id=2, ip="192.168.1.142", r_setpoint=22.0, sala=0, H=14, hidden=128, lr=1e-3, Wy=1.0, Wu=0.05, every=10, Ki=5e-3, b_max=2.0):
+    with open(f"estimacion_planta_{plant_id}.pkl", "rb") as f: est = pickle.load(f)
     A, B, C, D, Q, R = (np.asarray(est[k]) for k in ["A", "B", "C", "D", "Q", "R"])
     u_mean, u_std, y_mean, y_std = est["u_mean"], est["u_std"], est["y_mean"], est["y_std"]
     nx, ny, nu = A.shape[0], C.shape[0], B.shape[1]; nv = nu - 1
     dev = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     t = lambda M: torch.from_numpy(np.asarray(M, dtype=float)).float().to(dev)
     At, Bt, Ct, Dt, umean_t, ustd_t = t(A), t(B), t(C), t(D), t(u_mean), t(u_std)
-    rn = (torch.full((ny,), r_setpoint, device=dev) - t(y_mean)) / t(y_std)
+    ymean_t, ystd_t = t(y_mean), t(y_std)  # rn ahora se recalcula en el loop con la referencia corregida
     Pt = t(costo_terminal_P(A, B, C, D, Wy, Wu))  # costo terminal: se calcula una vez
     model = ControladorNeuronal(ny + nx + nv, nv, hidden).to(dev)
     opt = optim.Adam(model.parameters(), lr=lr)
     kalman = DiscreteKalmanFilter.create(A=A, B=B, C=C, Q=Q, R=R, P_init=np.eye(nx), D=D, x_init=np.zeros((nx, 1)))
     v_prev, losses, temps, iae, n = np.zeros(nv), [], [], 0.0, 0
-    client = MyClient("opc.tcp://192.168.1.142:4840/freeopcua/server/"); client.connect()
+    b = np.zeros(ny)  # sesgo integral por habitación (corrección de error de modelo en DC)
+    port = 4838 + plant_id  # 4840/4841/4842 para plantas 2/3/4
+    client = MyClient(f"opc.tcp://{ip}:{port}/freeopcua/server/"); client.connect()
     step = int(client.sim_step.get_value())
     try:
         while True:
@@ -99,7 +101,10 @@ def control(plant_id=2, r_setpoint=22.0, sala=0, H=14, hidden=128, lr=1e-3, Wy=1
             y_n = (y - y_mean) / y_std
             u_prev = (np.concatenate([v_prev, [tout]]) - u_mean) / u_std
             kalman.step(u_prev.reshape(nu, 1), y_n.reshape(ny, 1))
-            xstar_t = t(estado_equilibrio(A, B, C, D, u_mean, u_std, y_mean, y_std, r_setpoint, tout)[0])
+            b = np.clip(b + Ki * (r_setpoint - y), -b_max, b_max)  # integrador con anti-windup
+            r_eff = r_setpoint + b
+            rn = (t(r_eff) - ymean_t) / ystd_t
+            xstar_t = t(estado_equilibrio(A, B, C, D, u_mean, u_std, y_mean, y_std, r_eff, tout)[0])
             loss, _ = entrenar(model, opt, At, Bt, Ct, Dt, t(kalman.x.flatten()), t(y_n), t(v_prev),
                                rn, t(np.array([tout])), umean_t, ustd_t, H, Wy, Wu, xstar_t, Pt)
             model.eval()
@@ -111,17 +116,17 @@ def control(plant_id=2, r_setpoint=22.0, sala=0, H=14, hidden=128, lr=1e-3, Wy=1
             iae += float(np.abs(r_setpoint - y).sum())
             losses.append(loss); temps.append(float(y[sala]))
             if n % every == 0:
-                print(f"[{step}] T{sala+1}={y[sala]:.2f}°C ref={r_setpoint:.1f} loss={loss:.4f} IAE={iae:.1f}", end="\r", flush=True)
+                print(f"[{step}] T{sala+1}={y[sala]:.2f}°C ref={r_setpoint:.1f} b={b[sala]:+.2f} loss={loss:.4f} IAE={iae:.1f}", end="\r", flush=True)
             n += 1
     finally:
         client.disconnect()
-        os.makedirs("results", exist_ok=True)
-        with open(f"results/control_planta_{plant_id}.pkl", "wb") as f:
+        with open(f"control_planta_{plant_id}.pkl", "wb") as f:
             pickle.dump({"loss": np.array(losses), "temp": np.array(temps), "ref": r_setpoint, "sala": sala, "iae": iae}, f)
 
 
 def main():
-    control(plant_id=2)
+    import sys
+    control(plant_id=int(sys.argv[1]) if len(sys.argv) > 1 else 2)
 
 
 if __name__ == "__main__":
