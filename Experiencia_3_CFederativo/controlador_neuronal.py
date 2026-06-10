@@ -22,7 +22,41 @@ class ControladorNeuronal(nn.Module):
         return torch.tanh(self.l_out(x))
 
 
-def entrenar(model, opt, At, Bt, Ct, Dt, x, yc, v, rn, tout, umean, ustd, H, Wy, Wu, Wf):
+def costo_terminal_P(A, B, C, D, Wy, Wu, iters=500_000, tol=1e-9):
+    """Costo-por-ir de horizonte infinito: solución de la ecuación de Riccati discreta (DARE).
+    Tout es perturbación fija: solo las primeras nv columnas de B y D son manipulables."""
+    nv = B.shape[1] - 1
+    Bv, Dv = B[:, :nv], D[:, :nv]
+    ny = C.shape[0]
+    Qm = C.T @ (Wy * np.eye(ny)) @ C
+    Rm = Dv.T @ (Wy * np.eye(ny)) @ Dv + Wu * np.eye(nv)
+    Nm = C.T @ (Wy * np.eye(ny)) @ Dv
+    P = Qm.copy()
+    for _ in range(iters):
+        K = np.linalg.solve(Rm + Bv.T @ P @ Bv, Bv.T @ P @ A + Nm.T)
+        Pn = Qm + A.T @ P @ A - (A.T @ P @ Bv + Nm) @ K
+        Pn = 0.5 * (Pn + Pn.T)
+        if np.max(np.abs(Pn - P)) < tol:
+            return Pn
+        P = Pn
+    return P
+
+
+def estado_equilibrio(A, B, C, D, u_mean, u_std, y_mean, y_std, r_setpoint, tout):
+    """Estado x* y voltaje v* (físico) que sostienen y=r con la Tout dada."""
+    nx = A.shape[0]
+    nv = B.shape[1] - 1
+    Mdc = C @ np.linalg.solve(np.eye(nx) - A, B) + D
+    rn_ = (np.full(C.shape[0], r_setpoint) - y_mean) / y_std
+    tout_n = (tout - u_mean[-1]) / u_std[-1]
+    v_n = np.linalg.solve(Mdc[:, :nv], rn_ - Mdc[:, -1] * tout_n)
+    u_n = np.concatenate([v_n, [tout_n]])
+    xstar = np.linalg.solve(np.eye(nx) - A, B @ u_n)
+    vstar = v_n * u_std[:nv] + u_mean[:nv]          # voltaje de equilibrio en unidades físicas
+    return xstar, vstar
+
+
+def entrenar(model, opt, At, Bt, Ct, Dt, x, yc, v, rn, tout, umean, ustd, H, Wy, Wu, xstar, P):
     opt.zero_grad()
     J, v0 = 0.0, None
     for k in range(H):
@@ -33,20 +67,24 @@ def entrenar(model, opt, At, Bt, Ct, Dt, x, yc, v, rn, tout, umean, ustd, H, Wy,
         J = J + Wy * ((yc - rn) ** 2).sum() + Wu * ((vn - v) ** 2).sum()
         if k == 0: v0 = vn
         v = vn
-    J = J + Wf * ((yc - rn) ** 2).sum()
-    J.backward(); opt.step()
+    e = x - xstar
+    J = J + e @ P @ e
+    J.backward()
+    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+    opt.step()
     return J.item(), v0.detach().cpu().numpy()
 
 
-def control(plant_id=2, r_setpoint=22.0, sala=0, H=14, hidden=128, lr=1e-3, Wy=1.0, Wu=0.01, Wf=5.0, every=10):
+def control(plant_id=2, r_setpoint=22.0, sala=0, H=14, hidden=128, lr=1e-3, Wy=1.0, Wu=0.05, every=10):
     with open(f"results/estimacion_planta_{plant_id}.pkl", "rb") as f: est = pickle.load(f)
-    A, B, C, D, Q, R = est["A"], est["B"], est["C"], est["D"], est["Q"], est["R"]
+    A, B, C, D, Q, R = (np.asarray(est[k]) for k in ["A", "B", "C", "D", "Q", "R"])
     u_mean, u_std, y_mean, y_std = est["u_mean"], est["u_std"], est["y_mean"], est["y_std"]
     nx, ny, nu = A.shape[0], C.shape[0], B.shape[1]; nv = nu - 1
     dev = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     t = lambda M: torch.from_numpy(np.asarray(M, dtype=float)).float().to(dev)
     At, Bt, Ct, Dt, umean_t, ustd_t = t(A), t(B), t(C), t(D), t(u_mean), t(u_std)
     rn = (torch.full((ny,), r_setpoint, device=dev) - t(y_mean)) / t(y_std)
+    Pt = t(costo_terminal_P(A, B, C, D, Wy, Wu))  # costo terminal: se calcula una vez
     model = ControladorNeuronal(ny + nx + nv, nv, hidden).to(dev)
     opt = optim.Adam(model.parameters(), lr=lr)
     kalman = DiscreteKalmanFilter.create(A=A, B=B, C=C, Q=Q, R=R, P_init=np.eye(nx), D=D, x_init=np.zeros((nx, 1)))
@@ -61,8 +99,13 @@ def control(plant_id=2, r_setpoint=22.0, sala=0, H=14, hidden=128, lr=1e-3, Wy=1
             y_n = (y - y_mean) / y_std
             u_prev = (np.concatenate([v_prev, [tout]]) - u_mean) / u_std
             kalman.step(u_prev.reshape(nu, 1), y_n.reshape(ny, 1))
-            loss, v0 = entrenar(model, opt, At, Bt, Ct, Dt, t(kalman.x.flatten()), t(y_n), t(v_prev),
-                                rn, t(np.array([tout])), umean_t, ustd_t, H, Wy, Wu, Wf)
+            xstar_t = t(estado_equilibrio(A, B, C, D, u_mean, u_std, y_mean, y_std, r_setpoint, tout)[0])
+            loss, _ = entrenar(model, opt, At, Bt, Ct, Dt, t(kalman.x.flatten()), t(y_n), t(v_prev),
+                               rn, t(np.array([tout])), umean_t, ustd_t, H, Wy, Wu, xstar_t, Pt)
+            model.eval()
+            with torch.no_grad():
+                v0 = model(torch.cat([rn - t(y_n), t(kalman.x.flatten()), t(v_prev)])).cpu().numpy()
+            model.train()
             for i in range(nv): client.voltages[f'Volt_room{i+1}'].set_value(float(v0[i]))
             v_prev = v0
             iae += float(np.abs(r_setpoint - y).sum())
